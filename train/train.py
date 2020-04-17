@@ -251,6 +251,7 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
 
     # switch to train mode
     model.train()
+    train_preds, train_true = [], []
 
     start = end = time.time()
     global_step = 0
@@ -270,8 +271,12 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
             pred_ = pred.view(-1, pred.shape[-1])
             y_ = y.view(-1)
             loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+            train_true.append(label.detach().cpu().numpy())
+            train_preds.append(pred[:, seq_len // 2, :].detach().cpu().numpy().argmax(1))
         else:
             loss = L.FocalLoss(ignore_index=-1)(pred, label)
+            train_true.append(label.detach().cpu().numpy())
+            train_preds.append(pred.detach().cpu().numpy().argmax(1))
 
         # record loss
         losses.update(loss.item(), batch_size)
@@ -296,12 +301,8 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
 
         if step % CFG.print_freq == 0 or step == (len(train_loader)-1):
             # record accuracy
-            if model_type == 'seq2seq':
-                score = f1_score(pred[:, seq_len//2, :].detach().cpu().numpy().argmax(1), 
-                        label.detach().cpu().numpy(), labels=list(range(11)), average='macro')
-            else:
-                score = f1_score(pred.detach().cpu().numpy().argmax(1), 
-                        label.detach().cpu().numpy(), labels=list(range(11)), average='macro')        
+            score = f1_score(np.concatenate(train_preds), 
+                             np.concatenate(train_true), labels=list(range(11)), average='macro')
             scores.update(score, batch_size)
             
             print('Epoch: [{0}][{1}/{2}] '
@@ -322,6 +323,7 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
                    #lr=scheduler.optimizer.param_groups[0]['lr'],
                    sent_s=sent_count.avg/batch_time.avg
                    ))
+
     return losses.avg, scores.avg
 
 
@@ -359,22 +361,14 @@ def validate(valid_loader, model, device):
                 pred_ = pred.view(-1, pred.shape[-1])
                 y_ = y.view(-1)
                 loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+                predictions.append(pred[:, seq_len // 2, :].detach().cpu().numpy().argmax(1))
+                groundtruth.append(label.detach().cpu().numpy())
             else:
                 loss = L.FocalLoss(ignore_index=-1)(pred, label)
+                predictions.append(pred.detach().cpu().numpy().argmax(1))
+                groundtruth.append(label.detach().cpu().numpy())
 
             losses.update(loss.item(), batch_size)
-        
-        # record accuracy
-        if model_type == 'seq2seq':
-            predictions.append(pred[:, seq_len//2, :].detach().cpu().numpy().argmax(1))
-        else:
-            predictions.append(pred.detach().cpu().numpy().argmax(1))
-        groundtruth.append(label.detach().cpu().numpy())
-        
-        #score = f1_score(pred.detach().cpu().numpy().argmax(1), y.detach().cpu().numpy(), 
-        #                 labels=list(range(11)), average='macro') 
-        #score = f1_score(pred[:, seq_len//2, :].detach().cpu().numpy().argmax(1), label.detach().cpu().numpy(), labels=list(range(11)), average='macro')
-        #scores.update(score, batch_size)
         
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps    
@@ -385,20 +379,26 @@ def validate(valid_loader, model, device):
 
         sent_count.update(batch_size)
 
-        if step % CFG.print_freq == 0 or step == (len(valid_loader)-1):            
+        if step % CFG.print_freq == 0 or step == (len(valid_loader)-1):
+            # record accuracy
+            score = f1_score(np.concatenate(predictions), 
+                             np.concatenate(groundtruth), labels=list(range(11)), average='macro')
+            scores.update(score, batch_size)
+
             print('TEST: {0}/{1}] '
                   'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
                   'Elapsed {remain:s} '
                   'Loss: {loss.val:.4f}({loss.avg:.4f}) '
-                  #'Score: {score.val:.4f}({score.avg:.4f}) '
+                  'Score: {score.val:.4f}({score.avg:.4f}) '
                   'sent/s {sent_s:.0f} '
                   .format(
                    step, len(valid_loader), batch_time=batch_time,                   
                    data_time=data_time, loss=losses,
-                   #score=scores,
+                   score=scores,
                    remain=timeSince(start, float(step+1)/len(valid_loader)),
                    sent_s=sent_count.avg/batch_time.avg
                    ))
+
     predictions = np.concatenate(predictions)
     groundtruth = np.concatenate(groundtruth)
         
@@ -528,7 +528,8 @@ class CFG:
     seed=42
     encoder='TRANSFORMER'
     target_size=11
-    fold=0
+    n_fold=2
+    fold=[0, 1]
     model_type='seq2seq' #'seq2seq'
 
 
@@ -537,7 +538,6 @@ def main():
     # =====================================================================================
     # Settings
     # =====================================================================================
-    folds = pd.read_csv('../input/ion-folds/folds.csv')
     cont_cols = [c for c in X_train.columns if c.find('signal')>=0]
     print('cont_cols:', cont_cols)
     CFG.cont_cols = cont_cols
@@ -545,124 +545,135 @@ def main():
     print('device:', device)
 
     # =====================================================================================
-    # Prepare loader
+    # run function
     # =====================================================================================
-    trn_idx = folds[folds['fold']!=CFG.fold].index
-    val_idx = folds[folds['fold']==CFG.fold].index
-    
-    train_db = TrainDataset(X_train.loc[trn_idx].reset_index(drop=True), CFG.seq_len, cont_cols)
-    valid_db = TrainDataset(X_train.loc[val_idx].reset_index(drop=True), CFG.seq_len, cont_cols) 
+    def run(fold, trn_idx, val_idx):
 
-    train_loader = DataLoader(train_db, batch_size=CFG.batch_size, shuffle=True, num_workers=CFG.num_workers, pin_memory=True)
-    valid_loader = DataLoader(valid_db, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers, pin_memory=True)
-    
-    num_train_optimization_steps = int(len(train_db) / CFG.batch_size / CFG.gradient_accumulation_steps) * (CFG.num_train_epochs)
-    print('num_train_optimization_steps:', num_train_optimization_steps)  
-    
-    # =====================================================================================
-    # Prepare model
-    # =====================================================================================
-    model = TransfomerModel(CFG)
-    
-    # =====================================================================================
-    # Prepare optimizer
-    # =====================================================================================
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
-        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-        ]
-    optimizer = AdamW(optimizer_grouped_parameters,
-                      lr=CFG.learning_rate,
-                      weight_decay=CFG.weight_decay,                           
-                     )
-    # =====================================================================================
-    # Prepare scheduler
-    # =====================================================================================
-    """
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=CFG.warmup_steps, 
-                                                num_training_steps=num_train_optimization_steps)
-    """
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=1e3, max_lr=1e-3, epochs=CFG.num_train_epochs, steps_per_epoch=len(train_loader))
+        train_db = TrainDataset(X_train.loc[trn_idx].reset_index(drop=True), CFG.seq_len, cont_cols)
+        valid_db = TrainDataset(X_train.loc[val_idx].reset_index(drop=True), CFG.seq_len, cont_cols)
+
+        train_loader = DataLoader(train_db, batch_size=CFG.batch_size, shuffle=True, num_workers=CFG.num_workers, pin_memory=True)
+        valid_loader = DataLoader(valid_db, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers, pin_memory=True)
+
+        num_train_optimization_steps = int(len(train_db) / CFG.batch_size / CFG.gradient_accumulation_steps) * (CFG.num_train_epochs)
+        print('num_train_optimization_steps:', num_train_optimization_steps)
+
+        # =====================================================================================
+        # Prepare model
+        # =====================================================================================
+        model = TransfomerModel(CFG)
+
+        # =====================================================================================
+        # Prepare optimizer
+        # =====================================================================================
+        param_optimizer = list(model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+            ]
+        optimizer = AdamW(optimizer_grouped_parameters,
+                          lr=CFG.learning_rate,
+                          weight_decay=CFG.weight_decay,
+                         )
+        # =====================================================================================
+        # Prepare scheduler
+        # =====================================================================================
+        """
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=CFG.warmup_steps, 
+                                                    num_training_steps=num_train_optimization_steps)
+        """
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=1e3, max_lr=1e-3, epochs=CFG.num_train_epochs, steps_per_epoch=len(train_loader))
+
+        # =====================================================================================
+        # Prepare log utils
+        # =====================================================================================
+        def get_lr():
+            return scheduler.get_lr()[0]
+
+        log_df = pd.DataFrame(columns=(['EPOCH']+['LR']+['TRAIN_LOSS', 'TRAIN_SCORE']+['VALID_LOSS', 'VALID_SCORE']) )
+
+        curr_lr = get_lr()
+
+        print(f'initial learning rate: {curr_lr}')
+
+        # =====================================================================================
+        # Training loop
+        # =====================================================================================
+        best_score = 0
+        best_model = None
+        best_epoch = 0
+
+        model_list = []
+
+        model.to(device)
+
+        for epoch in range(CFG.start_epoch, CFG.num_train_epochs):
+
+            # train for one epoch
+            train_loss, train_score = train(train_loader, model, optimizer, epoch, scheduler, device)
+
+            valid_loss, valid_score, _, _ = validate(valid_loader, model, device)
+
+            curr_lr = get_lr()
+            print(f'set the learning_rate: {curr_lr}')
+
+            model_list.append(copy.deepcopy(model))
+            if epoch % CFG.test_freq == 0 and epoch >= 0:
+                log_row = {'EPOCH':epoch, 'LR':curr_lr,
+                           'TRAIN_LOSS':train_loss, 'TRAIN_SCORE':train_score,
+                           'VALID_LOSS':valid_loss, 'VALID_SCORE':valid_score,
+                           }
+                log_df = log_df.append(pd.DataFrame(log_row, index=[0]), sort=False)
+                print(log_df.tail(20))
+
+                batch_size = CFG.batch_size*CFG.gradient_accumulation_steps
+
+                if (best_score < valid_score):
+                    best_model = copy.deepcopy(model)
+                    best_score = valid_score
+                    best_epoch = epoch
+
+        model_to_save = best_model.module if hasattr(best_model, 'module') else best_model  # Only save the cust_model it-self
+        curr_model_name = (f'f-{fold}_b-{batch_size}_a-{CFG.encoder}_e-{CFG.emb_size}_h-{CFG.hidden_size}_'
+                           f'd-{CFG.dropout}_l-{CFG.nlayers}_hd-{CFG.nheads}_s-{CFG.seed}_len-{CFG.seq_len}.pt')
+        torch.save({
+            'epoch': best_epoch + 1,
+            'arch': 'transformer',
+            'state_dict': model_to_save.state_dict(),
+            'log': log_df,
+            },
+            OUTPUT_DIR+curr_model_name,
+        )
+
+        # check
+        model = TransfomerModel(CFG)
+        checkpoint = torch.load(OUTPUT_DIR + curr_model_name, map_location=device)
+        model.load_state_dict(checkpoint['state_dict'])
+        model.to(device)
+        valid_loss, valid_score, predictions, groundtruth = validate(valid_loader, model, device)
+        logger.info(f'[Fold{fold} Best Saved model] valid_loss:{valid_loss} valid_score:{valid_score}')
+
+        return predictions, groundtruth
 
     # =====================================================================================
-    # Prepare log utils
+    # k-fold
     # =====================================================================================
-    def get_lr():
-        return scheduler.get_lr()[0]
-    
-    log_df = pd.DataFrame(columns=(['EPOCH']+['LR']+['TRAIN_LOSS', 'TRAIN_SCORE']+['VALID_LOSS', 'VALID_SCORE']) )  
-        
-    curr_lr = get_lr()
-    
-    print(f'initial learning rate: {curr_lr}')
-    
-    # =====================================================================================
-    # Training loop
-    # =====================================================================================
-    best_score = 0
-    best_model = None
-    best_epoch = 0
-    
-    model_list = []
-    
-    model.to(device)
-            
-    for epoch in range(CFG.start_epoch, CFG.num_train_epochs):
-        
-        # train for one epoch
-        train_loss, train_score = train(train_loader, model, optimizer, epoch, scheduler, device)
-        
-        valid_loss, valid_score, _, _ = validate(valid_loader, model, device)        
-    
-        curr_lr = get_lr()       
-        print(f'set the learning_rate: {curr_lr}')
-        
-        model_list.append(copy.deepcopy(model))
-        if epoch % CFG.test_freq == 0 and epoch >= 0:
-            log_row = {'EPOCH':epoch, 'LR':curr_lr,
-                       'TRAIN_LOSS':train_loss, 'TRAIN_SCORE':train_score,
-                       'VALID_LOSS':valid_loss, 'VALID_SCORE':valid_score,
-                       } 
-            log_df = log_df.append(pd.DataFrame(log_row, index=[0]), sort=False)                        
-            print(log_df.tail(20))           
-            
-            batch_size = CFG.batch_size*CFG.gradient_accumulation_steps
-                        
-            if (best_score < valid_score):
-                best_model = copy.deepcopy(model)
-                best_score = valid_score
-                best_epoch = epoch
-            
-    last_model = best_model
-    last_params = dict(last_model.named_parameters())
-    for i in range(len(model_list)-1):
-        curr_params = dict(model_list[i].named_parameters())        
-        for name, param  in last_params.items():      
-            param.data += curr_params[name].data
-    for name, param  in last_params.items():
-        param.data /= len(model_list)
-    model = last_model
-    
-    #valid_loss, valid_score, _, _ = validate(valid_loader, model, device)
-    #logger.info(f'[result] valid_loss:{valid_loss} valid_score:{valid_score}')
-    logger.info(log_df.tail(20))
-    model_to_save = model.module if hasattr(model, 'module') else model  # Only save the cust_model it-self    
-    
-    curr_model_name = (f'f-{CFG.fold}_b-{batch_size}_a-{CFG.encoder}_e-{CFG.emb_size}_h-{CFG.hidden_size}_'
-                       f'd-{CFG.dropout}_l-{CFG.nlayers}_hd-{CFG.nheads}_s-{CFG.seed}_len-{CFG.seq_len}.pt')
-    torch.save({
-        'epoch': best_epoch + 1,
-        'arch': 'transformer',
-        'state_dict': model_to_save.state_dict(),
-        'log': log_df,
-        },        
-        OUTPUT_DIR+curr_model_name,
-    )
+    folds = pd.read_csv('../input/ion-folds/folds.csv')
+    predictions, groundtruth = [], []
+    for fold in CFG.fold:
+        trn_idx = folds[folds['fold'] != fold].index
+        val_idx = folds[folds['fold'] == fold].index
+        with timer(f'##### Running Fold: {fold} #####'):
+            _predictions, _groundtruth = run(fold, trn_idx, val_idx)
+            predictions.append(_predictions)
+            groundtruth.append(_groundtruth)
+    predictions = np.concatenate(predictions)
+    groundtruth = np.concatenate(groundtruth)
+    score = f1_score(predictions, groundtruth, labels=list(range(11)), average='macro')
+    logger.info(f'##### CV Score: {score} #####')
 
 
 if __name__ == '__main__':
     main()
-
 
