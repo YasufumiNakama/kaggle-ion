@@ -379,7 +379,9 @@ class Wavenet(nn.Module):
         self.layer2 = self._make_layers(16, 32, 3, 8)
         self.layer3 = self._make_layers(32, 64, 3, 4)
         self.layer4 = self._make_layers(64, 128, 3, 1)
-        self.rnn = nn.GRU(input_size=8, hidden_size=64, num_layers=2,
+        self.lstm = nn.LSTM(input_size=8, hidden_size=64, num_layers=2, 
+                            bidirectional=True, batch_first=True, dropout=0.3)
+        self.gru = nn.GRU(64*2, hidden_size=64, num_layers=2,
                             bidirectional=True, batch_first=True, dropout=0.3)
         def get_reg():
             return nn.Sequential(
@@ -404,8 +406,8 @@ class Wavenet(nn.Module):
 
     def forward(self, x):
         # RNN
-        outputs, _ = self.rnn(x)
-        #print(outputs.size())
+        h_lstm, _ = self.lstm(x)
+        h_gru, _ = self.gru(h_lstm)
         # CNN
         x = x.permute(0, 2, 1)
         x = self.layer1(x)
@@ -416,7 +418,7 @@ class Wavenet(nn.Module):
         #print(x.shape)
         # CNN & RNN
         #x = x + outputs
-        x = torch.cat((x, outputs.permute(0, 2, 1)), 1).permute(0, 2, 1)
+        x = torch.cat((x, h_gru.permute(0, 2, 1)), 1).permute(0, 2, 1)
         #print(x.shape)
         # fc
         x = self.fc(x)
