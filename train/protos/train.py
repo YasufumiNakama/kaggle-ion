@@ -1,40 +1,9 @@
-
 # =====================================================================================
 # Directory Settings
 # =====================================================================================
-import os
 ROOT = '../input/liverpool-ion-switching/'
 CLEAN_ROOT = '../input/data-without-drift/'
-OUTPUT_DIR = './output/'
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
-
-
-class CFG:
-    learning_rate=1.0e-3
-    batch_size=16
-    num_workers=6
-    print_freq=1000
-    test_freq=1
-    start_epoch=0
-    num_train_epochs=150
-    warmup_steps=30
-    max_grad_norm=1000
-    gradient_accumulation_steps=1
-    weight_decay=0.01
-    dropout=0.3
-    emb_size=100
-    hidden_size=128
-    nlayers=2
-    nheads=10
-    seq_len=4000
-    total_cate_size=40
-    seed=1225
-    encoder='Wavenet'
-    optimizer='Adam' #@param ['AdamW', 'Adam']
-    target_size=11
-    n_fold=5
-    fold=[1, 2, 3, 4] #[0]
+OUTPUT_DIR = './'
 
 
 # =====================================================================================
@@ -61,11 +30,6 @@ import torch
 
 import warnings
 warnings.filterwarnings("ignore")
-
-USE_APEX = False
-
-if USE_APEX:
-    from apex import amp
 
 # =====================================================================================
 # Utils
@@ -136,25 +100,19 @@ with timer('Data Loading'):
 
 
 # =====================================================================================
-# Preprocess
+# FE
 # =====================================================================================
-X_train['batch'] = X_train.index // 500000
-X_train['batch'] = X_train['batch'].astype(int)
+def rolling_features(df):
 
+    window_sizes = [1000, 2000, 5000, 9000]
 
-def signal2cate(X_train, X_test=None, NUM_BINS=1000):
-    signal_bins = np.linspace(X_train['signal'].min(), X_train['signal'].max(), NUM_BINS + 1)
-    train_signal_dig = np.digitize(X_train['signal'], bins=signal_bins) - 1
-    train_signal_dig = np.minimum(train_signal_dig, len(signal_bins) - 2)
-    X_train['signal_cate'] = train_signal_dig
-    if X_test is not None:
-        test_signal_dig = np.digitize(X_test['signal'], bins=signal_bins) - 1
-        test_signal_dig = np.minimum(test_signal_dig, len(signal_bins) - 2)
-        X_test['signal_cate'] = test_signal_dig
-        return  X_train, X_test
-    return X_train
+    for window in window_sizes:
+        rolling = df['signal'].rolling(window=window)
+        df["signal_rolling_std_" + str(window)] = rolling.std()
+        
+    return df
 
-X_train = signal2cate(X_train, X_test=None, NUM_BINS=CFG.total_cate_size)
+#X_train = rolling_features(X_train)
 
 
 # =====================================================================================
@@ -164,85 +122,74 @@ from torch.utils.data import Dataset
 
 
 class TrainDataset(Dataset):
-    def __init__(self, df, sample_indices, cfg):
-        self.df = df.copy()
+    def __init__(self, df, seq_len, cont_cols):
+        self.df = df.copy()  
         self.target = df[TARGET].values
-        self.sample_indices = sample_indices
-        self.cfg = cfg
-        self.seq_len = self.cfg.seq_len
-        self.cont_cols = self.cfg.cont_cols
-        self.cate_cols = self.cfg.cate_cols
+        self.seq_len = seq_len
+        self.cont_cols = cont_cols
         self.cont_df = self.df[self.cont_cols]
-        self.cate_df = self.df[self.cate_cols]
-
+        
     def __getitem__(self, idx):
-        indices = self.sample_indices[idx]
+        if idx//500000 == (idx - self.seq_len//2)//500000:
+            start_index = idx - self.seq_len//2
+        else:
+            start_index = idx//500000*500000
+        if idx//500000 == (idx + self.seq_len//2)//500000:
+            end_index = idx + self.seq_len//2
+        else:
+            end_index = (idx + self.seq_len//2)//500000*500000
+        indices = self.df.iloc[start_index:end_index].index.tolist()
         seq_len = min(self.seq_len, len(indices))
-
+        
         tmp_cont_x = torch.FloatTensor(self.cont_df.iloc[indices].values)
         cont_x = torch.FloatTensor(self.seq_len, len(self.cont_cols)).zero_()
         cont_x[-seq_len:] = tmp_cont_x[-seq_len:]
-
-        tmp_cate_x = torch.LongTensor(self.cate_df.iloc[indices].values)
-        cate_x = torch.LongTensor(self.seq_len, len(self.cate_cols)).zero_()
-        cate_x[-seq_len:] = tmp_cate_x[-seq_len:]
-
+        
+        mask = torch.ByteTensor(self.seq_len).zero_()
+        mask[-seq_len:] = 1
+        
+        label = self.target[idx]
         target = np.zeros(self.seq_len) - 1
-        target[-seq_len:] = self.target[indices]
+        target[-seq_len:] = self.target[start_index:end_index]
 
-        return cate_x, cont_x, target
+        return cont_x, mask, target, label
 
     def __len__(self):
-        return len(self.sample_indices)
+        return len(self.df)
+
 
 
 # =====================================================================================
-# Wavenet Model
+# Model
 # =====================================================================================
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.modeling_bert import BertConfig, BertEncoder, BertModel
 
 
-class wave_block(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, dilation):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.in_ch = in_ch
-        self.out_ch = out_ch
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=int((kernel_size + (kernel_size-1)*(dilation-1))/2), dilation=dilation)
-        self.conv3 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=int((kernel_size + (kernel_size-1)*(dilation-1))/2), dilation=dilation)
-        self.conv4 = nn.Conv1d(out_ch, out_ch, 1)
-        self.tanh = nn.Tanh()
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        res_x = x
-        tanh = self.tanh(self.conv2(x))
-        sig = self.sigmoid(self.conv3(x))
-        res = tanh.mul(sig)
-        x = self.conv4(res)
-        x = res_x + x
-        return x
-
-
-class Wavenet(nn.Module):
-    def __init__(self, cfg, basic_block=wave_block):
-        super().__init__()
+class TransfomerModel(nn.Module):
+    def __init__(self, cfg):
+        super(TransfomerModel, self).__init__()
         self.cfg = cfg
-        self.basic_block = basic_block
-        cont_col_size = len(cfg.cont_cols)
-        #cate_col_size = len(cfg.cate_cols)
-        self.cate_emb = nn.Embedding(cfg.total_cate_size, cfg.emb_size, padding_idx=0)
-        #self.cate_proj = nn.Sequential(
-        #    nn.Linear(cfg.emb_size*cate_col_size, cfg.hidden_size//2),
-        #    nn.LayerNorm(cfg.hidden_size//2),
-        #)
-        self.layer1 = self._make_layers(cont_col_size, cfg.hidden_size//16, 3, 12)
-        self.layer2 = self._make_layers(cfg.hidden_size//16, cfg.hidden_size//8, 3, 8)
-        self.layer3 = self._make_layers(cfg.hidden_size//8, cfg.hidden_size//4, 3, 4)
-        self.layer4 = self._make_layers(cfg.hidden_size//4, cfg.hidden_size//2, 3, 1)
-        self.gru = nn.GRU(input_size=cfg.emb_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
-                          bidirectional=True, batch_first=True, dropout=cfg.dropout)
+        cont_col_size = len(cfg.cont_cols)     
+        self.cont_emb = nn.Sequential(                
+            nn.Linear(cont_col_size, cfg.hidden_size),
+            nn.LayerNorm(cfg.hidden_size),
+        )
+        self.position_emb = nn.Embedding(num_embeddings=self.cfg.seq_len, embedding_dim=cfg.hidden_size)
+        self.ln = nn.LayerNorm(cfg.hidden_size)
+        self.config = BertConfig( 
+            3, # not used
+            hidden_size=cfg.hidden_size,
+            num_hidden_layers=cfg.nlayers,
+            num_attention_heads=cfg.nheads,
+            intermediate_size=cfg.hidden_size,
+            hidden_dropout_prob=cfg.dropout,
+            attention_probs_dropout_prob=cfg.dropout,
+        )
+        self.encoder = BertEncoder(self.config)        
+        
         def get_reg():
             return nn.Sequential(
             nn.Linear(cfg.hidden_size, cfg.hidden_size),
@@ -254,36 +201,37 @@ class Wavenet(nn.Module):
             nn.Dropout(cfg.dropout),
             nn.ReLU(),
             nn.Linear(cfg.hidden_size, cfg.target_size),
-        )
-        self.fc = get_reg()
+        )        
+        self.reg_layer = get_reg()
+        
+    def forward(self, cont_x, mask):
+        seq_emb = self.cont_emb(cont_x)
+        
+        #seq_length = self.cfg.seq_len
+        #batch_size = cont_x.size(0)
+        #position_ids = torch.arange(seq_length, dtype=torch.long, device=cont_x.device)
+        #position_ids = position_ids.unsqueeze(0).expand((batch_size, seq_length))
+        #position_emb = self.position_emb(position_ids)
+        #seq_emb = (seq_emb + position_emb)
+        #seq_emb = self.ln(seq_emb)
 
-    def _make_layers(self, in_ch, out_ch, kernel_size, n):
-        dilation_rates = [2 ** i for i in range(n)]
-        layers = [nn.Conv1d(in_ch, out_ch, 1)]
-        for dilation in dilation_rates:
-            layers.append(self.basic_block(out_ch, out_ch, kernel_size, dilation))
-        return nn.Sequential(*layers)
-
-    def forward(self, cate_x, cont_x):
-        batch_size = cate_x.size(0)
-        # RNN
-        cate_emb = self.cate_emb(cate_x).view(batch_size, self.cfg.seq_len, -1)
-        h_gru, _ = self.gru(cate_emb)
-        # CNN
-        cont_x = cont_x.permute(0, 2, 1)
-        cont_x = self.layer1(cont_x)
-        cont_x = self.layer2(cont_x)
-        cont_x = self.layer3(cont_x)
-        cont_x = self.layer4(cont_x)
-        # CNN & RNN
-        x = torch.cat((cont_x, h_gru.permute(0, 2, 1)), 1).permute(0, 2, 1)
-        # fc
-        x = self.fc(x)
-        return x
+        extended_attention_mask = mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        head_mask = [None] * self.config.num_hidden_layers
+        
+        encoded_layers = self.encoder(seq_emb, extended_attention_mask, head_mask=head_mask)
+        sequence_output = encoded_layers[-1]
+        
+        if self.cfg.model_type == 'seq2seq':
+            pred_y = self.reg_layer(sequence_output)
+        else:
+            pred_y = self.reg_layer(sequence_output[:, self.cfg.seq_len//2])
+        return pred_y
 
 
 # =====================================================================================
-# Train functions
+# Train functions 
 # =====================================================================================
 import math
 from sklearn.metrics import f1_score
@@ -292,55 +240,58 @@ from pytorch_toolbelt import losses as L
 
 
 def train(train_loader, model, optimizer, epoch, scheduler, device):
-
+    
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     scores = AverageMeter()
     sent_count = AverageMeter()
+    seq_len = model.cfg.seq_len
+    model_type = model.cfg.model_type
 
     # switch to train mode
     model.train()
-    train_preds, train_true = torch.Tensor([]).to(device), torch.LongTensor([]).to(device)
+    train_preds, train_true = [], []
 
     start = end = time.time()
     global_step = 0
-
-    for step, (cate_x, cont_x, y) in enumerate(train_loader):
+    
+    for step, (cont_x, mask, y, label) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
-        cate_x, cont_x, y = cate_x.to(device), cont_x.to(device), y.to(device)
-        batch_size = cont_x.size(0)
-
+        
+        cont_x, mask, y = cont_x.to(device), mask.to(device), y.to(device)
+        label = label.to(device)
+        batch_size = cont_x.size(0)        
+        
         # compute loss
-        pred = model(cate_x, cont_x)
+        pred = model(cont_x, mask)
 
-        pred_ = pred.view(-1, pred.shape[-1])
-        y_ = y.view(-1)
-        loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+        if model_type == 'seq2seq':
+            pred_ = pred.view(-1, pred.shape[-1])
+            y_ = y.view(-1)
+            loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+            train_true.append(label.detach().cpu().numpy())
+            train_preds.append(pred[:, seq_len // 2, :].detach().cpu().numpy().argmax(1))
+        else:
+            loss = L.FocalLoss(ignore_index=-1)(pred, label)
+            train_true.append(label.detach().cpu().numpy())
+            train_preds.append(pred.detach().cpu().numpy().argmax(1))
 
         # record loss
         losses.update(loss.item(), batch_size)
-        train_true = torch.cat([train_true, y_.long()], 0)
-        train_preds = torch.cat([train_preds, pred_], 0)
-
+        
         if CFG.gradient_accumulation_steps > 1:
             loss = loss / CFG.gradient_accumulation_steps
-
-        if USE_APEX:
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            loss.backward()
         
+        loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
-
-        if (step + 1) % CFG.gradient_accumulation_steps == 0:
+        
+        if (step + 1) % CFG.gradient_accumulation_steps == 0:      
             scheduler.step()
             optimizer.step()
             optimizer.zero_grad()
-            global_step += 1
+            global_step += 1    
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -350,8 +301,10 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
 
         if step % CFG.print_freq == 0 or step == (len(train_loader)-1):
             # record accuracy
-            score = f1_score(train_true.cpu().detach().numpy(), train_preds.cpu().detach().numpy().argmax(1), labels=list(range(11)), average='macro')
+            score = f1_score(np.concatenate(train_preds), 
+                             np.concatenate(train_true), labels=list(range(11)), average='macro')
             scores.update(score, batch_size)
+            
             print('Epoch: [{0}][{1}/{2}] '
                   'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
                   'Elapsed {remain:s} '
@@ -361,60 +314,64 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
                   'LR: {lr:.6f}  '
                   'sent/s {sent_s:.0f} '
                   .format(
-                   epoch, step, len(train_loader), batch_time=batch_time,
+                   epoch, step, len(train_loader), batch_time=batch_time,                   
                    data_time=data_time, loss=losses,
                    score=scores,
                    remain=timeSince(start, float(step+1)/len(train_loader)),
                    grad_norm=grad_norm,
                    lr=scheduler.get_lr()[0],
+                   #lr=scheduler.optimizer.param_groups[0]['lr'],
                    sent_s=sent_count.avg/batch_time.avg
                    ))
-    
-    predictions = train_preds.cpu().detach().numpy().argmax(1)
-    groundtruth = train_true.cpu().detach().numpy()
-    score = f1_score(predictions, groundtruth, labels=list(range(11)), average='macro')
 
-    return losses.avg, score
+    return losses.avg, scores.avg
 
 
 def validate(valid_loader, model, device):
-
+    
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     scores = AverageMeter()
     sent_count = AverageMeter()
-
+    seq_len = model.cfg.seq_len
+    model_type = model.cfg.model_type
+    
     # switch to evaluation mode
     model.eval()
-    val_preds, val_true = torch.Tensor([]).to(device), torch.LongTensor([]).to(device)
 
     start = end = time.time()
-
-    for step, (cate_x, cont_x, y) in enumerate(valid_loader):
+    
+    predictions = []
+    groundtruth = []
+    for step, (cont_x, mask, y, label) in enumerate(valid_loader):
         # measure data loading time
-        data_time.update(time.time() - end)
-
-        cate_x, cont_x, y = cate_x.to(device), cont_x.to(device), y.to(device)
+        data_time.update(time.time() - end)        
+        
+        cont_x, mask, y = cont_x.to(device), mask.to(device), y.to(device)
+        label = label.to(device)
         batch_size = cont_x.size(0)
-
+        
         # compute loss
-        with torch.no_grad():
-            pred = model(cate_x, cont_x)
+        with torch.no_grad():        
+            pred = model(cont_x, mask)        
 
             # record loss
-            pred_ = pred.view(-1, pred.shape[-1])
-            y_ = y.view(-1)
-            loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+            if model_type == 'seq2seq':
+                pred_ = pred.view(-1, pred.shape[-1])
+                y_ = y.view(-1)
+                loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+                predictions.append(pred[:, seq_len // 2, :].detach().cpu().numpy().argmax(1))
+                groundtruth.append(label.detach().cpu().numpy())
+            else:
+                loss = L.FocalLoss(ignore_index=-1)(pred, label)
+                predictions.append(pred.detach().cpu().numpy().argmax(1))
+                groundtruth.append(label.detach().cpu().numpy())
 
             losses.update(loss.item(), batch_size)
-
-        # record accuracy
-        val_true = torch.cat([val_true, y_.long()], 0)
-        val_preds = torch.cat([val_preds, pred_], 0)
-
+        
         if CFG.gradient_accumulation_steps > 1:
-            loss = loss / CFG.gradient_accumulation_steps
+            loss = loss / CFG.gradient_accumulation_steps    
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -423,25 +380,31 @@ def validate(valid_loader, model, device):
         sent_count.update(batch_size)
 
         if step % CFG.print_freq == 0 or step == (len(valid_loader)-1):
+            # record accuracy
+            score = f1_score(np.concatenate(predictions), 
+                             np.concatenate(groundtruth), labels=list(range(11)), average='macro')
+            scores.update(score, batch_size)
+
             print('TEST: {0}/{1}] '
                   'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
                   'Elapsed {remain:s} '
                   'Loss: {loss.val:.4f}({loss.avg:.4f}) '
-                  #'Score: {score.val:.4f}({score.avg:.4f}) '
+                  'Score: {score.val:.4f}({score.avg:.4f}) '
                   'sent/s {sent_s:.0f} '
                   .format(
-                   step, len(valid_loader), batch_time=batch_time,
+                   step, len(valid_loader), batch_time=batch_time,                   
                    data_time=data_time, loss=losses,
-                   #score=scores,
+                   score=scores,
                    remain=timeSince(start, float(step+1)/len(valid_loader)),
                    sent_s=sent_count.avg/batch_time.avg
                    ))
 
+    predictions = np.concatenate(predictions)
+    groundtruth = np.concatenate(groundtruth)
+        
     # scoring
-    predictions = val_preds.cpu().detach().numpy().argmax(1)
-    groundtruth = val_true.cpu().detach().numpy()
-    score = f1_score(predictions, groundtruth, labels=list(range(11)), average='macro')
-
+    score = f1_score(predictions, groundtruth, labels=list(range(11)), average='macro') 
+    
     return losses.avg, score, predictions, groundtruth
 
 
@@ -486,17 +449,54 @@ def timeSince(since, percent):
     return '%s (remain %s)' % (asMinutes(s), asMinutes(rs))
 
 
+def adjust_learning_rate(optimizer, epoch):  
+    #lr  = CFG.learning_rate     
+    lr = (CFG.lr_decay)**(epoch//10) * CFG.learning_rate    
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr    
+    return lr
+
+
 # =====================================================================================
-# Get Sample function
+# Sampler
 # =====================================================================================
-def get_sample_indices(df):
-    sample_indices = []
-    group_indices = []
-    df_groups = df.groupby('group').groups
-    for group_idx, indices in enumerate(df_groups.values()):
-        sample_indices.append(indices.values)
-        group_indices.append(group_idx)
-    return np.array(sample_indices), group_indices
+from torch.utils.data.sampler import Sampler
+
+
+class BalanceSampler(Sampler):
+    def __init__(self, df, balance_col):
+        self.length = len(df)
+        self.balance_col = balance_col
+        self.num_class = df[balance_col].nunique()
+        class_map_df = pd.DataFrame({balance_col: df[balance_col].unique()}).reset_index()
+        class_map_df.columns = ['label', balance_col]
+        self.class_map = dict(class_map_df[[balance_col, 'label']].values)
+        group = []
+        target_gb = df.groupby([TARGET])
+        for k, _ in self.class_map.items():
+            g = target_gb.get_group(k).index
+            group.append(list(g))
+            assert(len(g)>0)
+        self.group = group
+
+    def __iter__(self):
+        index = []
+        n = 0
+        is_loop = True
+        while is_loop:
+            c = np.arange(self.num_class)
+            np.random.shuffle(c)
+            for t in c:
+                i = np.random.choice(self.group[t])
+                index.append(i)
+                n += 1
+                if n == self.length:
+                    is_loop = False
+                    break
+        return iter(index)
+
+    def __len__(self):
+        return self.length
 
 
 # =====================================================================================
@@ -504,74 +504,86 @@ def get_sample_indices(df):
 # =====================================================================================
 import copy
 from torch.utils.data import DataLoader
+from transformers import AdamW, get_linear_schedule_with_warmup
+
+
+class CFG:
+    learning_rate=1.0e-4
+    batch_size=256
+    num_workers=6
+    print_freq=1000
+    test_freq=1
+    start_epoch=0
+    num_train_epochs=10
+    warmup_steps=30
+    max_grad_norm=1000
+    gradient_accumulation_steps=1
+    weight_decay=0.01    
+    dropout=0.1
+    emb_size=100
+    hidden_size=100
+    nlayers=2
+    nheads=10
+    seq_len=100
+    seed=42
+    encoder='TRANSFORMER'
+    target_size=11
+    n_fold=2
+    fold=[0, 1]
+    model_type='seq2seq' #'seq2seq'
 
 
 def main():
-
+    
     # =====================================================================================
     # Settings
     # =====================================================================================
-    cate_cols = ['signal_cate']
     cont_cols = [c for c in X_train.columns if c.find('signal')>=0]
-    cont_cols = [c for c in cont_cols if c not in cate_cols]
-    logger.info(f'cont_cols: {cont_cols}')
-    logger.info(f'cate_cols: {cate_cols}')
+    print('cont_cols:', cont_cols)
     CFG.cont_cols = cont_cols
-    CFG.cate_cols = cate_cols
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f'device: {device}')
-
+    print('device:', device)
 
     # =====================================================================================
     # run function
     # =====================================================================================
     def run(fold, trn_idx, val_idx):
 
-        train_samples = sample_indices[trn_idx]
-        valid_samples = sample_indices[val_idx]
-
-        train_db = TrainDataset(X_train, train_samples, CFG)
-        valid_db = TrainDataset(X_train, valid_samples, CFG)
+        train_db = TrainDataset(X_train.loc[trn_idx].reset_index(drop=True), CFG.seq_len, cont_cols)
+        valid_db = TrainDataset(X_train.loc[val_idx].reset_index(drop=True), CFG.seq_len, cont_cols)
 
         train_loader = DataLoader(train_db, batch_size=CFG.batch_size, shuffle=True, num_workers=CFG.num_workers, pin_memory=True)
         valid_loader = DataLoader(valid_db, batch_size=CFG.batch_size, shuffle=False, num_workers=CFG.num_workers, pin_memory=True)
 
         num_train_optimization_steps = int(len(train_db) / CFG.batch_size / CFG.gradient_accumulation_steps) * (CFG.num_train_epochs)
-        logger.info(f'num_train_optimization_steps: {num_train_optimization_steps}')
+        print('num_train_optimization_steps:', num_train_optimization_steps)
 
         # =====================================================================================
         # Prepare model
         # =====================================================================================
-        model = Wavenet(CFG)
-        model.to(device)
+        model = TransfomerModel(CFG)
 
         # =====================================================================================
         # Prepare optimizer
         # =====================================================================================
-        if CFG.optimizer=='AdamW':
-            param_optimizer = list(model.named_parameters())
-            no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-            optimizer_grouped_parameters = [
+        param_optimizer = list(model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
             {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
             {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
-            optimizer = AdamW(optimizer_grouped_parameters,
-                        lr=CFG.learning_rate,
-                        weight_decay=CFG.weight_decay,
-                        )
-        else:
-            optimizer = torch.optim.Adam(model.parameters(), lr=CFG.learning_rate)
-        
-        # =====================================================================================
-        # Apex
-        # =====================================================================================
-        if USE_APEX:
-            model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
-
+        optimizer = AdamW(optimizer_grouped_parameters,
+                          lr=CFG.learning_rate,
+                          weight_decay=CFG.weight_decay,
+                         )
         # =====================================================================================
         # Prepare scheduler
         # =====================================================================================
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=1e3, max_lr=CFG.learning_rate, epochs=CFG.num_train_epochs, steps_per_epoch=len(train_loader))
+        """
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=CFG.warmup_steps, 
+                                                    num_training_steps=num_train_optimization_steps)
+        """
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=1e3, max_lr=1e-3, epochs=CFG.num_train_epochs, steps_per_epoch=len(train_loader))
 
         # =====================================================================================
         # Prepare log utils
@@ -580,8 +592,10 @@ def main():
             return scheduler.get_lr()[0]
 
         log_df = pd.DataFrame(columns=(['EPOCH']+['LR']+['TRAIN_LOSS', 'TRAIN_SCORE']+['VALID_LOSS', 'VALID_SCORE']) )
+
         curr_lr = get_lr()
-        logger.info(f'initial learning rate: {curr_lr}')
+
+        print(f'initial learning rate: {curr_lr}')
 
         # =====================================================================================
         # Training loop
@@ -591,6 +605,8 @@ def main():
         best_epoch = 0
 
         model_list = []
+
+        model.to(device)
 
         for epoch in range(CFG.start_epoch, CFG.num_train_epochs):
 
@@ -605,14 +621,11 @@ def main():
             model_list.append(copy.deepcopy(model))
             if epoch % CFG.test_freq == 0 and epoch >= 0:
                 log_row = {'EPOCH':epoch, 'LR':curr_lr,
-                        'TRAIN_LOSS':train_loss, 'TRAIN_SCORE':train_score,
-                        'VALID_LOSS':valid_loss, 'VALID_SCORE':valid_score,
-                        }
+                           'TRAIN_LOSS':train_loss, 'TRAIN_SCORE':train_score,
+                           'VALID_LOSS':valid_loss, 'VALID_SCORE':valid_score,
+                           }
                 log_df = log_df.append(pd.DataFrame(log_row, index=[0]), sort=False)
-                logger.info('Current Scores')
-                logger.info(log_df.tail(5))
-                logger.info('Best Scores')
-                logger.info(log_df.sort_values('VALID_SCORE').tail(5))
+                print(log_df.tail(20))
 
                 batch_size = CFG.batch_size*CFG.gradient_accumulation_steps
 
@@ -623,7 +636,7 @@ def main():
 
         model_to_save = best_model.module if hasattr(best_model, 'module') else best_model  # Only save the cust_model it-self
         curr_model_name = (f'f-{fold}_b-{batch_size}_a-{CFG.encoder}_e-{CFG.emb_size}_h-{CFG.hidden_size}_'
-                       f'd-{CFG.dropout}_l-{CFG.nlayers}_hd-{CFG.nheads}_s-{CFG.seed}_len-{CFG.seq_len}.pt')
+                           f'd-{CFG.dropout}_l-{CFG.nlayers}_hd-{CFG.nheads}_s-{CFG.seed}_len-{CFG.seq_len}.pt')
         torch.save({
             'epoch': best_epoch + 1,
             'arch': 'transformer',
@@ -634,8 +647,8 @@ def main():
         )
 
         # check
-        model = Wavenet(CFG)
-        checkpoint = torch.load(OUTPUT_DIR+curr_model_name, map_location=device)
+        model = TransfomerModel(CFG)
+        checkpoint = torch.load(OUTPUT_DIR + curr_model_name, map_location=device)
         model.load_state_dict(checkpoint['state_dict'])
         model.to(device)
         valid_loss, valid_score, predictions, groundtruth = validate(valid_loader, model, device)
@@ -646,17 +659,15 @@ def main():
     # =====================================================================================
     # k-fold
     # =====================================================================================
-    X_train['group'] = X_train.index // CFG.seq_len
-    sample_indices, group_indices = get_sample_indices(X_train)
-    skf = GroupKFold(n_splits=CFG.n_fold)
-    splits = [x for x in skf.split(sample_indices, None, group_indices)]
+    folds = pd.read_csv('../input/ion-folds/folds.csv')
     predictions, groundtruth = [], []
-    for fold, (trn_idx, val_idx) in enumerate(splits):
-        if fold in CFG.fold:
-            with timer(f'##### Running Fold: {fold} #####'):
-                _predictions, _groundtruth = run(fold, trn_idx, val_idx)
-                predictions.append(_predictions)
-                groundtruth.append(_groundtruth)
+    for fold in CFG.fold:
+        trn_idx = folds[folds['fold'] != fold].index
+        val_idx = folds[folds['fold'] == fold].index
+        with timer(f'##### Running Fold: {fold} #####'):
+            _predictions, _groundtruth = run(fold, trn_idx, val_idx)
+            predictions.append(_predictions)
+            groundtruth.append(_groundtruth)
     predictions = np.concatenate(predictions)
     groundtruth = np.concatenate(groundtruth)
     score = f1_score(predictions, groundtruth, labels=list(range(11)), average='macro')
@@ -665,3 +676,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
