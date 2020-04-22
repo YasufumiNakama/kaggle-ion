@@ -33,7 +33,7 @@ class CFG:
     optimizer='Adam' #@param ['AdamW', 'Adam']
     target_size=11
     n_fold=4
-    fold=[0, 1, 2, 3]
+    fold=[1, 2, 3]
 
 
 # =====================================================================================
@@ -184,8 +184,7 @@ df_path_dict = {'train': CLEAN_ROOT+'train_clean.csv',
                 'sample_submission': ROOT+'sample_submission.csv'}
 ID = 'time'
 TARGET = 'open_channels'
-SEED = 42
-seed_everything(seed=SEED)
+seed_everything(seed=CFG.seed)
 
 
 # =====================================================================================
@@ -313,25 +312,23 @@ class Wavenet(nn.Module):
         #    nn.Linear(cfg.emb_size*cate_col_size, cfg.hidden_size//2),
         #    nn.LayerNorm(cfg.hidden_size//2),
         #)
-        self.layer1 = self._make_layers(cont_col_size, cfg.hidden_size//32, 3, 16)
-        self.layer2 = self._make_layers(cfg.hidden_size//32, cfg.hidden_size//16, 3, 12)
-        self.layer3 = self._make_layers(cfg.hidden_size//16, cfg.hidden_size//8, 3, 8)
-        self.layer4 = self._make_layers(cfg.hidden_size//8, cfg.hidden_size//4, 3, 4)
-        self.layer5 = self._make_layers(cfg.hidden_size//4, cfg.hidden_size//2, 3, 2)
-        self.layer6 = self._make_layers(cfg.hidden_size//2, cfg.hidden_size, 3, 1)
-        self.gru = nn.GRU(input_size=cfg.emb_size, hidden_size=cfg.hidden_size//2, num_layers=cfg.nlayers,
+        self.layer1 = self._make_layers(cont_col_size, cfg.hidden_size//16, 3, 12)
+        self.layer2 = self._make_layers(cfg.hidden_size//16, cfg.hidden_size//8, 3, 8)
+        self.layer3 = self._make_layers(cfg.hidden_size//8, cfg.hidden_size//4, 3, 4)
+        self.layer4 = self._make_layers(cfg.hidden_size//4, cfg.hidden_size//2, 3, 1)
+        self.gru = nn.GRU(input_size=cfg.emb_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
                           bidirectional=True, batch_first=True, dropout=cfg.dropout)
         def get_reg():
             return nn.Sequential(
-            nn.Linear(cfg.hidden_size*2, cfg.hidden_size*2),
-            nn.LayerNorm(cfg.hidden_size*2),
+            nn.Linear(cfg.hidden_size, cfg.hidden_size),
+            nn.LayerNorm(cfg.hidden_size),
             nn.Dropout(cfg.dropout),
             nn.ReLU(),
-            nn.Linear(cfg.hidden_size*2, cfg.hidden_size*2),
-            nn.LayerNorm(cfg.hidden_size*2),
+            nn.Linear(cfg.hidden_size, cfg.hidden_size),
+            nn.LayerNorm(cfg.hidden_size),
             nn.Dropout(cfg.dropout),
             nn.ReLU(),
-            nn.Linear(cfg.hidden_size*2, cfg.target_size),
+            nn.Linear(cfg.hidden_size, cfg.target_size),
         )
         self.fc = get_reg()
 
@@ -353,8 +350,6 @@ class Wavenet(nn.Module):
         cont_x = self.layer2(cont_x)
         cont_x = self.layer3(cont_x)
         cont_x = self.layer4(cont_x)
-        cont_x = self.layer5(cont_x)
-        cont_x = self.layer6(cont_x)
         # CNN & RNN
         x = torch.cat((cont_x, h_gru.permute(0, 2, 1)), 1).permute(0, 2, 1)
         # fc
@@ -753,7 +748,7 @@ def main(X_train):
     group_indices = [group_map[i] for i in group_indices]
     print(len(group_indices))
     print(len(set(group_indices)))
-    #folds = make_stratified_group_k_folds(X_train, _id='time', target='open_channels', group='split_group', k=CFG.n_fold)
+    #folds = make_stratified_group_k_folds(X_train, _id='time', target='open_channels', group='split_group', k=CFG.n_fold, seed=CFG.seed)
     folds = pd.read_csv('../input/ion-folds/folds.csv')
     folds_map = dict(folds[['split_group', 'fold']].values.tolist())
     group_indices = [folds_map[i] for i in group_indices]
