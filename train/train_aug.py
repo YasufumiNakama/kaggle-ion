@@ -24,12 +24,11 @@ class CFG:
     weight_decay=0.01
     dropout=0.3
     emb_size=100
-    hidden_size=128
+    hidden_size=164
     nlayers=2
     nheads=10
     seq_len=5000
     total_cate_size=40
-    n_cluster=3
     seed=1225
     encoder='Wavenet'
     optimizer='Adam' #@param ['AdamW', 'Adam']
@@ -53,7 +52,6 @@ import pandas as pd
 import random
 import json
 
-from sklearn.cluster import KMeans
 from sklearn.model_selection import StratifiedKFold, GroupKFold
 from sklearn import preprocessing
 
@@ -235,21 +233,6 @@ def add_num_features(X_train, X_test=None):
 X_train = add_num_features(X_train, X_test=None)
 
 
-def categorize_batch(X_train, X_test=None):
-    a = X_train[['batch', 'signal']].groupby('batch').std().add_prefix('std_')
-    kmeans = KMeans(n_clusters=CFG.n_cluster, random_state=0).fit(a[['std_signal']])
-    a['batch_category'] = kmeans.labels_
-    X_train = X_train.merge(a.reset_index()[['batch', 'batch_category']], on='batch', how='left')
-    if X_test is not None:
-        b = X_test[['batch', 'signal']].groupby('batch').std().add_prefix('std_')
-        b['batch_category'] = kmeans.predict(b[['std_signal']])
-        X_test = X_test.merge(b.reset_index()[['batch', 'batch_category']], on='batch', how='left')
-        return X_train, X_test
-    return X_train
-
-X_train = categorize_batch(X_train, X_test=None)
-
-
 def calc_gradients(df):
 
     df['signal_gradient'] = np.gradient(df['signal'].values)
@@ -346,7 +329,7 @@ class Wavenet(nn.Module):
         self.basic_block = basic_block
         cont_col_size = len(cfg.cont_cols)
         cate_col_size = len(cfg.cate_cols)
-        self.cate_emb = nn.Embedding(cfg.total_cate_size+cfg.n_cluster, cfg.emb_size, padding_idx=0)
+        self.cate_emb = nn.Embedding(cfg.total_cate_size, cfg.emb_size, padding_idx=0)
         #self.cate_proj = nn.Sequential(
         #    nn.Linear(cfg.emb_size*cate_col_size, cfg.hidden_size//2),
         #    nn.LayerNorm(cfg.hidden_size//2),
@@ -355,7 +338,7 @@ class Wavenet(nn.Module):
         self.layer2 = self._make_layers(cfg.hidden_size//16, cfg.hidden_size//8, 3, 8)
         self.layer3 = self._make_layers(cfg.hidden_size//8, cfg.hidden_size//4, 3, 4)
         self.layer4 = self._make_layers(cfg.hidden_size//4, cfg.hidden_size//2, 3, 1)
-        self.gru = nn.GRU(input_size=cfg.emb_size*cate_col_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
+        self.gru = nn.GRU(input_size=cfg.emb_size*cate_col_size+cont_col_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
                           bidirectional=True, batch_first=True, dropout=cfg.dropout)
         def get_reg():
             return nn.Sequential(
@@ -382,7 +365,9 @@ class Wavenet(nn.Module):
         batch_size = cate_x.size(0)
         # RNN
         cate_emb = self.cate_emb(cate_x).view(batch_size, self.cfg.seq_len, -1)
-        h_gru, _ = self.gru(cate_emb)
+        #h_gru, _ = self.gru(cate_emb)
+        seq_emb = torch.cat((cate_emb, cont_x), 2)
+        h_gru, _ = self.gru(seq_emb)
         # CNN
         cont_x = cont_x.permute(0, 2, 1)
         cont_x = self.layer1(cont_x)
