@@ -11,8 +11,8 @@ if not os.path.exists(OUTPUT_DIR):
 
 
 class CFG:
-    learning_rate=3.0e-3
-    batch_size=32
+    learning_rate=1.0e-3
+    batch_size=16
     num_workers=6
     print_freq=1000
     test_freq=1
@@ -24,17 +24,17 @@ class CFG:
     weight_decay=0.01
     dropout=0.3
     emb_size=100
-    hidden_size=164
+    hidden_size=128
     nlayers=2
     nheads=10
-    seq_len=5000
+    seq_len=4000
     total_cate_size=40
     seed=1225
     encoder='Wavenet'
     optimizer='Adam' #@param ['AdamW', 'Adam']
     target_size=11
-    n_fold=4
-    fold=[0, 1, 2, 3]
+    n_fold=5
+    fold=[1, 2, 3, 4] #[0]
 
 
 # =====================================================================================
@@ -114,69 +114,6 @@ def load_df(path, debug=False):
     return df
 
 
-def make_stratified_group_k_folds(_df, _id, target, group, k, seed=42, save_path=OUTPUT_DIR+'folds.csv'):
-
-    def stratified_group_k_fold(X, y, groups, k, seed=42):
-
-        """
-        original author : jakubwasikowski
-        reference : https://www.kaggle.com/jakubwasikowski/stratified-group-k-fold-cross-validation
-        """
-
-        labels_num = np.max(y) + 1
-        y_counts_per_group = defaultdict(lambda: np.zeros(labels_num))
-        y_distr = Counter()
-        for label, g in zip(y, groups):
-            y_counts_per_group[g][label] += 1
-            y_distr[label] += 1
-
-        y_counts_per_fold = defaultdict(lambda: np.zeros(labels_num))
-        groups_per_fold = defaultdict(set)
-
-        def eval_y_counts_per_fold(y_counts, fold):
-            y_counts_per_fold[fold] += y_counts
-            std_per_label = []
-            for label in range(labels_num):
-                label_std = np.std([y_counts_per_fold[i][label] / y_distr[label] for i in range(k)])
-                std_per_label.append(label_std)
-            y_counts_per_fold[fold] -= y_counts
-            return np.mean(std_per_label)
-
-        groups_and_y_counts = list(y_counts_per_group.items())
-        random.Random(seed).shuffle(groups_and_y_counts)
-
-        for g, y_counts in sorted(groups_and_y_counts, key=lambda x: -np.std(x[1])):
-            best_fold = None
-            min_eval = None
-            for i in range(k):
-                fold_eval = eval_y_counts_per_fold(y_counts, i)
-                if min_eval is None or fold_eval < min_eval:
-                    min_eval = fold_eval
-                    best_fold = i
-            y_counts_per_fold[best_fold] += y_counts
-            groups_per_fold[best_fold].add(g)
-
-        all_groups = set(groups)
-        for i in range(k):
-            train_groups = all_groups - groups_per_fold[i]
-            test_groups = groups_per_fold[i]
-
-            train_indices = [i for i, g in enumerate(groups) if g in train_groups]
-            test_indices = [i for i, g in enumerate(groups) if g in test_groups]
-
-            yield train_indices, test_indices
-
-    df = _df.copy()
-    le = preprocessing.LabelEncoder()
-    groups = le.fit_transform(df[group].values)
-    for n, (train_index, val_index) in enumerate(stratified_group_k_fold(df, df[target], groups, k=k, seed=seed)):
-        df.loc[val_index, 'fold'] = int(n)
-    df['fold'] = df['fold'].astype(int)
-    df[[_id, target, group, 'fold']].to_csv(save_path, index=None)
-
-    return df[[_id, target, group, 'fold']]
-
-
 # =====================================================================================
 # General Settings
 # =====================================================================================
@@ -185,7 +122,8 @@ df_path_dict = {'train': CLEAN_ROOT+'train_clean.csv',
                 'sample_submission': ROOT+'sample_submission.csv'}
 ID = 'time'
 TARGET = 'open_channels'
-seed_everything(seed=CFG.seed)
+SEED = 42
+seed_everything(seed=SEED)
 
 
 # =====================================================================================
@@ -217,40 +155,6 @@ def signal2cate(X_train, X_test=None, NUM_BINS=1000):
     return X_train
 
 X_train = signal2cate(X_train, X_test=None, NUM_BINS=CFG.total_cate_size)
-
-
-def add_num_features(X_train, X_test=None):
-    max_signal = X_train['signal'].max()
-    min_signal = X_train['signal'].min()
-    X_train['signal_diff_max'] = max_signal - X_train['signal']
-    X_train['signal_diff_min'] = min_signal - X_train['signal']
-    if X_test is not None:
-        X_test['signal_diff_max'] = max_signal - X_test['signal']
-        X_test['signal_diff_min'] = min_signal - X_test['signal']
-        return  X_train, X_test
-    return X_train
-
-X_train = add_num_features(X_train, X_test=None)
-
-
-def calc_gradients(df):
-
-    df['signal_gradient'] = np.gradient(df['signal'].values)
-
-    return df
-
-def preprocess_df(df):
-
-    output = pd.DataFrame()
-
-    for i in range(int(len(df)/500000)):
-        tmp = df.loc[i * 500000: 500000*(i + 1) - 1].reset_index(drop=True)
-        tmp = calc_gradients(tmp)
-        output = pd.concat([output, tmp])
-
-    return output.reset_index(drop=True)
-
-X_train = preprocess_df(X_train)
 
 
 # =====================================================================================
@@ -310,7 +214,6 @@ class wave_block(nn.Module):
         self.conv4 = nn.Conv1d(out_ch, out_ch, 1)
         self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
-        self.bn = nn.BatchNorm1d(out_ch)
 
     def forward(self, x):
         res_x = x
@@ -328,7 +231,7 @@ class Wavenet(nn.Module):
         self.cfg = cfg
         self.basic_block = basic_block
         cont_col_size = len(cfg.cont_cols)
-        cate_col_size = len(cfg.cate_cols)
+        #cate_col_size = len(cfg.cate_cols)
         self.cate_emb = nn.Embedding(cfg.total_cate_size, cfg.emb_size, padding_idx=0)
         #self.cate_proj = nn.Sequential(
         #    nn.Linear(cfg.emb_size*cate_col_size, cfg.hidden_size//2),
@@ -338,7 +241,7 @@ class Wavenet(nn.Module):
         self.layer2 = self._make_layers(cfg.hidden_size//16, cfg.hidden_size//8, 3, 8)
         self.layer3 = self._make_layers(cfg.hidden_size//8, cfg.hidden_size//4, 3, 4)
         self.layer4 = self._make_layers(cfg.hidden_size//4, cfg.hidden_size//2, 3, 1)
-        self.gru = nn.GRU(input_size=cfg.emb_size*cate_col_size+cont_col_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
+        self.gru = nn.GRU(input_size=cfg.emb_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
                           bidirectional=True, batch_first=True, dropout=cfg.dropout)
         def get_reg():
             return nn.Sequential(
@@ -365,9 +268,7 @@ class Wavenet(nn.Module):
         batch_size = cate_x.size(0)
         # RNN
         cate_emb = self.cate_emb(cate_x).view(batch_size, self.cfg.seq_len, -1)
-        #h_gru, _ = self.gru(cate_emb)
-        seq_emb = torch.cat((cate_emb, cont_x), 2)
-        h_gru, _ = self.gru(seq_emb)
+        h_gru, _ = self.gru(cate_emb)
         # CNN
         cont_x = cont_x.permute(0, 2, 1)
         cont_x = self.layer1(cont_x)
@@ -588,27 +489,13 @@ def timeSince(since, percent):
 # =====================================================================================
 # Get Sample function
 # =====================================================================================
-def tta_group(X_train):
-    tmp = X_train[CFG.seq_len//2:len(X_train)-CFG.seq_len//2].reset_index(drop=True)
-    tmp['tta_group'] = tmp.index // CFG.seq_len
-    tmp['tta_group'] = tmp['tta_group'] + tmp['group'].nunique()
-    X_train = pd.concat([X_train[:CFG.seq_len//2], 
-                         tmp, 
-                         X_train[len(X_train)-CFG.seq_len//2:]]).reset_index(drop=True).fillna(-1)
-    return X_train
-
-
 def get_sample_indices(df):
     sample_indices = []
     group_indices = []
     df_groups = df.groupby('group').groups
-    tta_df_groups = df[df['tta_group']>=0].groupby('tta_group').groups
     for group_idx, indices in enumerate(df_groups.values()):
         sample_indices.append(indices.values)
         group_indices.append(group_idx)
-    for group_idx, indices in enumerate(tta_df_groups.values()):
-        sample_indices.append(indices.values)
-        group_indices.append(group_idx+len(df_groups))
     return np.array(sample_indices), group_indices
 
 
@@ -619,12 +506,12 @@ import copy
 from torch.utils.data import DataLoader
 
 
-def main(X_train):
+def main():
 
     # =====================================================================================
     # Settings
     # =====================================================================================
-    cate_cols = [c for c in X_train.columns if c.find('cate')>=0]
+    cate_cols = ['signal_cate']
     cont_cols = [c for c in X_train.columns if c.find('signal')>=0]
     cont_cols = [c for c in cont_cols if c not in cate_cols]
     logger.info(f'cont_cols: {cont_cols}')
@@ -760,22 +647,7 @@ def main(X_train):
     # k-fold
     # =====================================================================================
     X_train['group'] = X_train.index // CFG.seq_len
-    X_train = tta_group(X_train)
-    X_train['tta_group'] = X_train['tta_group'].astype(int)
-    X_train['split_group'] = X_train.index // (CFG.seq_len*2)
     sample_indices, group_indices = get_sample_indices(X_train)
-    print(len(group_indices))
-    print(len(set(group_indices)))
-    group_map = dict(X_train[['group', 'split_group']].values.tolist())
-    tta_group_map = dict(X_train[['tta_group', 'split_group']].values.tolist())
-    group_map.update(tta_group_map)
-    group_indices = [group_map[i] for i in group_indices]
-    print(len(group_indices))
-    print(len(set(group_indices)))
-    #folds = make_stratified_group_k_folds(X_train, _id='time', target='open_channels', group='split_group', k=CFG.n_fold, seed=CFG.seed)
-    folds = pd.read_csv('../input/ion-folds/folds.csv')
-    folds_map = dict(folds[['split_group', 'fold']].values.tolist())
-    group_indices = [folds_map[i] for i in group_indices]
     skf = GroupKFold(n_splits=CFG.n_fold)
     splits = [x for x in skf.split(sample_indices, None, group_indices)]
     predictions, groundtruth = [], []
@@ -792,4 +664,4 @@ def main(X_train):
 
 
 if __name__ == '__main__':
-    main(X_train)
+    main()

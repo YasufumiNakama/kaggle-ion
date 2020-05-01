@@ -1,4 +1,3 @@
-
 # =====================================================================================
 # Directory Settings
 # =====================================================================================
@@ -11,8 +10,8 @@ if not os.path.exists(OUTPUT_DIR):
 
 
 class CFG:
-    learning_rate=1.0e-3
-    batch_size=16
+    learning_rate=3.0e-3
+    batch_size=32
     num_workers=6
     print_freq=1000
     test_freq=1
@@ -24,17 +23,17 @@ class CFG:
     weight_decay=0.01
     dropout=0.3
     emb_size=100
-    hidden_size=128
+    hidden_size=164
     nlayers=2
     nheads=10
-    seq_len=4000
+    seq_len=5000
     total_cate_size=40
-    seed=1225
+    seed=777
     encoder='Wavenet'
     optimizer='Adam' #@param ['AdamW', 'Adam']
     target_size=11
-    n_fold=5
-    fold=[1, 2, 3, 4] #[0]
+    n_fold=4
+    fold=[0, 1, 2, 3]
 
 
 # =====================================================================================
@@ -54,6 +53,7 @@ import json
 
 from sklearn.model_selection import StratifiedKFold, GroupKFold
 from sklearn import preprocessing
+from sklearn.cluster import KMeans
 
 from tqdm import tqdm, tqdm_notebook
 
@@ -114,6 +114,69 @@ def load_df(path, debug=False):
     return df
 
 
+def make_stratified_group_k_folds(_df, _id, target, group, k, seed=42, save_path=OUTPUT_DIR+'folds.csv'):
+
+    def stratified_group_k_fold(X, y, groups, k, seed=42):
+
+        """
+        original author : jakubwasikowski
+        reference : https://www.kaggle.com/jakubwasikowski/stratified-group-k-fold-cross-validation
+        """
+
+        labels_num = np.max(y) + 1
+        y_counts_per_group = defaultdict(lambda: np.zeros(labels_num))
+        y_distr = Counter()
+        for label, g in zip(y, groups):
+            y_counts_per_group[g][label] += 1
+            y_distr[label] += 1
+
+        y_counts_per_fold = defaultdict(lambda: np.zeros(labels_num))
+        groups_per_fold = defaultdict(set)
+
+        def eval_y_counts_per_fold(y_counts, fold):
+            y_counts_per_fold[fold] += y_counts
+            std_per_label = []
+            for label in range(labels_num):
+                label_std = np.std([y_counts_per_fold[i][label] / y_distr[label] for i in range(k)])
+                std_per_label.append(label_std)
+            y_counts_per_fold[fold] -= y_counts
+            return np.mean(std_per_label)
+
+        groups_and_y_counts = list(y_counts_per_group.items())
+        random.Random(seed).shuffle(groups_and_y_counts)
+
+        for g, y_counts in sorted(groups_and_y_counts, key=lambda x: -np.std(x[1])):
+            best_fold = None
+            min_eval = None
+            for i in range(k):
+                fold_eval = eval_y_counts_per_fold(y_counts, i)
+                if min_eval is None or fold_eval < min_eval:
+                    min_eval = fold_eval
+                    best_fold = i
+            y_counts_per_fold[best_fold] += y_counts
+            groups_per_fold[best_fold].add(g)
+
+        all_groups = set(groups)
+        for i in range(k):
+            train_groups = all_groups - groups_per_fold[i]
+            test_groups = groups_per_fold[i]
+
+            train_indices = [i for i, g in enumerate(groups) if g in train_groups]
+            test_indices = [i for i, g in enumerate(groups) if g in test_groups]
+
+            yield train_indices, test_indices
+
+    df = _df.copy()
+    le = preprocessing.LabelEncoder()
+    groups = le.fit_transform(df[group].values)
+    for n, (train_index, val_index) in enumerate(stratified_group_k_fold(df, df[target], groups, k=k, seed=seed)):
+        df.loc[val_index, 'fold'] = int(n)
+    df['fold'] = df['fold'].astype(int)
+    df[[_id, target, group, 'fold']].to_csv(save_path, index=None)
+
+    return df[[_id, target, group, 'fold']]
+
+
 # =====================================================================================
 # General Settings
 # =====================================================================================
@@ -122,8 +185,7 @@ df_path_dict = {'train': CLEAN_ROOT+'train_clean.csv',
                 'sample_submission': ROOT+'sample_submission.csv'}
 ID = 'time'
 TARGET = 'open_channels'
-SEED = 42
-seed_everything(seed=SEED)
+seed_everything(seed=CFG.seed)
 
 
 # =====================================================================================
@@ -133,7 +195,17 @@ with timer('Data Loading'):
     X_train = load_df(path=df_path_dict['train'])
     #X_test = load_df(path=df_path_dict['test'])
     #sample_submission = load_df(path=df_path_dict['sample_submission'])
+    oof_lgb = pd.read_csv('../input/ion-oof/oof_lightgbm.csv').rename(columns={TARGET:'signal_lgb_oof'})
+    oof_cat = pd.read_csv('../input/ion-oof/oof_catboost.csv').rename(columns={TARGET:'signal_cat_oof'})
+    oof_xgb = pd.read_csv('../input/ion-oof/oof_xgb.csv').rename(columns={TARGET:'signal_xgb_oof'})
+    #oof_nn = pd.read_csv('../input/ion-oof/oof_nn.csv')
 
+    X_train = pd.concat([X_train, oof_lgb['signal_lgb_oof']], axis=1)
+    X_train = pd.concat([X_train, oof_cat['signal_cat_oof']], axis=1)
+    X_train = pd.concat([X_train, oof_xgb['signal_xgb_oof']], axis=1)
+    #X_train = pd.concat([X_train, oof_nn.drop(columns=ID)], axis=1)
+
+    del oof_lgb, oof_cat, oof_xgb; gc.collect()
 
 # =====================================================================================
 # Preprocess
@@ -155,6 +227,54 @@ def signal2cate(X_train, X_test=None, NUM_BINS=1000):
     return X_train
 
 X_train = signal2cate(X_train, X_test=None, NUM_BINS=CFG.total_cate_size)
+
+
+def add_num_features(X_train, X_test=None):
+    max_signal = X_train['signal'].max()
+    min_signal = X_train['signal'].min()
+    X_train['signal_diff_max'] = max_signal - X_train['signal']
+    X_train['signal_diff_min'] = min_signal - X_train['signal']
+    if X_test is not None:
+        X_test['signal_diff_max'] = max_signal - X_test['signal']
+        X_test['signal_diff_min'] = min_signal - X_test['signal']
+        return  X_train, X_test
+    return X_train
+
+X_train = add_num_features(X_train, X_test=None)
+
+def categorize_batch(X_train, X_test=None):
+    a = X_train[['batch', 'signal']].groupby('batch').std().add_prefix('std_')
+    kmeans = KMeans(n_clusters=5, random_state=CFG.seed).fit(a[['std_signal']])
+    a['batch_category'] = kmeans.labels_
+    print(f'kmeans.labels_: {kmeans.labels_}')
+    X_train = X_train.merge(a.reset_index()[['batch', 'batch_category']], on='batch', how='left')
+    if X_test is not None:
+        b = X_test[['batch', 'signal']].groupby('batch').std().add_prefix('std_')
+        b['batch_category'] = kmeans.predict(b[['std_signal']])
+        X_test = X_test.merge(b.reset_index()[['batch', 'batch_category']], on='batch', how='left')
+        return X_train, X_test
+    return X_train
+
+#X_train = categorize_batch(X_train, X_test=None)
+
+def calc_gradients(df):
+
+    df['signal_gradient'] = np.gradient(df['signal'].values)
+
+    return df
+
+def preprocess_df(df):
+
+    output = pd.DataFrame()
+
+    for i in range(int(len(df)/500000)):
+        tmp = df.loc[i * 500000: 500000*(i + 1) - 1].reset_index(drop=True)
+        tmp = calc_gradients(tmp)
+        output = pd.concat([output, tmp])
+
+    return output.reset_index(drop=True)
+
+X_train = preprocess_df(X_train)
 
 
 # =====================================================================================
@@ -214,13 +334,14 @@ class wave_block(nn.Module):
         self.conv4 = nn.Conv1d(out_ch, out_ch, 1)
         self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
+        self.bn = nn.BatchNorm1d(out_ch)
 
     def forward(self, x):
         res_x = x
         tanh = self.tanh(self.conv2(x))
         sig = self.sigmoid(self.conv3(x))
-        res = tanh.mul(sig)
-        x = self.conv4(res)
+        x = tanh.mul(sig)
+        x = self.conv4(x)
         x = res_x + x
         return x
 
@@ -231,7 +352,7 @@ class Wavenet(nn.Module):
         self.cfg = cfg
         self.basic_block = basic_block
         cont_col_size = len(cfg.cont_cols)
-        #cate_col_size = len(cfg.cate_cols)
+        cate_col_size = len(cfg.cate_cols)
         self.cate_emb = nn.Embedding(cfg.total_cate_size, cfg.emb_size, padding_idx=0)
         #self.cate_proj = nn.Sequential(
         #    nn.Linear(cfg.emb_size*cate_col_size, cfg.hidden_size//2),
@@ -241,7 +362,7 @@ class Wavenet(nn.Module):
         self.layer2 = self._make_layers(cfg.hidden_size//16, cfg.hidden_size//8, 3, 8)
         self.layer3 = self._make_layers(cfg.hidden_size//8, cfg.hidden_size//4, 3, 4)
         self.layer4 = self._make_layers(cfg.hidden_size//4, cfg.hidden_size//2, 3, 1)
-        self.gru = nn.GRU(input_size=cfg.emb_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
+        self.gru = nn.GRU(input_size=cfg.emb_size*cate_col_size+cont_col_size, hidden_size=cfg.hidden_size//4, num_layers=cfg.nlayers,
                           bidirectional=True, batch_first=True, dropout=cfg.dropout)
         def get_reg():
             return nn.Sequential(
@@ -268,7 +389,8 @@ class Wavenet(nn.Module):
         batch_size = cate_x.size(0)
         # RNN
         cate_emb = self.cate_emb(cate_x).view(batch_size, self.cfg.seq_len, -1)
-        h_gru, _ = self.gru(cate_emb)
+        seq_emb = torch.cat((cate_emb, cont_x), 2)
+        h_gru, _ = self.gru(seq_emb)
         # CNN
         cont_x = cont_x.permute(0, 2, 1)
         cont_x = self.layer1(cont_x)
@@ -319,6 +441,7 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
         pred_ = pred.view(-1, pred.shape[-1])
         y_ = y.view(-1)
         loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+        #loss = nn.CrossEntropyLoss(ignore_index=-1)(pred_, y_.long())
 
         # record loss
         losses.update(loss.item(), batch_size)
@@ -370,6 +493,9 @@ def train(train_loader, model, optimizer, epoch, scheduler, device):
                    sent_s=sent_count.avg/batch_time.avg
                    ))
     
+    #optimizer.update_swa()
+    #optimizer.swap_swa_sgd()
+
     predictions = train_preds.cpu().detach().numpy().argmax(1)
     groundtruth = train_true.cpu().detach().numpy()
     score = f1_score(predictions, groundtruth, labels=list(range(11)), average='macro')
@@ -406,6 +532,7 @@ def validate(valid_loader, model, device):
             pred_ = pred.view(-1, pred.shape[-1])
             y_ = y.view(-1)
             loss = L.FocalLoss(ignore_index=-1)(pred_, y_)
+            #loss = nn.CrossEntropyLoss(ignore_index=-1)(pred_, y_.long())
 
             losses.update(loss.item(), batch_size)
 
@@ -489,13 +616,30 @@ def timeSince(since, percent):
 # =====================================================================================
 # Get Sample function
 # =====================================================================================
+def tta_group(X_train):
+    X_train = X_train.reset_index()
+    tmp = pd.DataFrame()
+    for i in tqdm(range(int(len(X_train)/500000))):
+        _tmp = X_train[i*500000+CFG.seq_len//2:(i+1)*500000-CFG.seq_len//2].reset_index(drop=True)
+        tmp = pd.concat([tmp, _tmp])
+    tmp = tmp.reset_index(drop=True)
+    tmp['tta_group'] = tmp.index // CFG.seq_len
+    tmp['tta_group'] = tmp['tta_group'] + X_train['group'].nunique()
+    X_train = X_train.merge(tmp[['index', 'tta_group']], on='index', how='left').fillna(-1).drop(columns='index')
+    return X_train
+
+
 def get_sample_indices(df):
     sample_indices = []
     group_indices = []
     df_groups = df.groupby('group').groups
+    tta_df_groups = df[df['tta_group']>=0].groupby('tta_group').groups
     for group_idx, indices in enumerate(df_groups.values()):
         sample_indices.append(indices.values)
         group_indices.append(group_idx)
+    for group_idx, indices in enumerate(tta_df_groups.values()):
+        sample_indices.append(indices.values)
+        group_indices.append(group_idx+len(df_groups))
     return np.array(sample_indices), group_indices
 
 
@@ -504,14 +648,16 @@ def get_sample_indices(df):
 # =====================================================================================
 import copy
 from torch.utils.data import DataLoader
+#import torchcontrib
+#from torchcontrib.optim import SWA
 
 
-def main():
+def main(X_train):
 
     # =====================================================================================
     # Settings
     # =====================================================================================
-    cate_cols = ['signal_cate']
+    cate_cols = [c for c in X_train.columns if c.find('cate')>=0]
     cont_cols = [c for c in X_train.columns if c.find('signal')>=0]
     cont_cols = [c for c in cont_cols if c not in cate_cols]
     logger.info(f'cont_cols: {cont_cols}')
@@ -561,6 +707,7 @@ def main():
                         )
         else:
             optimizer = torch.optim.Adam(model.parameters(), lr=CFG.learning_rate)
+            #optimizer = torchcontrib.optim.SWA(optimizer, swa_start=10, swa_freq=2, swa_lr=1e-3)        
         
         # =====================================================================================
         # Apex
@@ -572,7 +719,8 @@ def main():
         # Prepare scheduler
         # =====================================================================================
         scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=1e3, max_lr=CFG.learning_rate, epochs=CFG.num_train_epochs, steps_per_epoch=len(train_loader))
-
+        #schedular = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=2, factor=0.2)
+        
         # =====================================================================================
         # Prepare log utils
         # =====================================================================================
@@ -647,12 +795,33 @@ def main():
     # k-fold
     # =====================================================================================
     X_train['group'] = X_train.index // CFG.seq_len
+    X_train = tta_group(X_train)
+    X_train['tta_group'] = X_train['tta_group'].astype(int)
+    X_train['split_group'] = X_train.index // (CFG.seq_len*2)
     sample_indices, group_indices = get_sample_indices(X_train)
+    print(len(group_indices))
+    print(len(set(group_indices)))
+    group_map = dict(X_train[['group', 'split_group']].values.tolist())
+    tta_group_map = dict(X_train[['tta_group', 'split_group']].values.tolist())
+    group_map.update(tta_group_map)
+    group_indices = [group_map[i] for i in group_indices]
+    print(len(group_indices))
+    print(len(set(group_indices)))
+    folds = make_stratified_group_k_folds(X_train, _id='time', target='open_channels', group='split_group', k=CFG.n_fold, seed=CFG.seed)
+    #folds = pd.read_csv('../input/ion-folds/folds.csv')
+    folds_map = dict(folds[['split_group', 'fold']].values.tolist())
+    group_indices = [folds_map[i] for i in group_indices]
     skf = GroupKFold(n_splits=CFG.n_fold)
     splits = [x for x in skf.split(sample_indices, None, group_indices)]
     predictions, groundtruth = [], []
     for fold, (trn_idx, val_idx) in enumerate(splits):
         if fold in CFG.fold:
+            # without leak tta for val_idx
+            normal_val_idx = val_idx[val_idx<(5000000//CFG.seq_len)]
+            tta_val_idx = val_idx[val_idx>=(5000000//CFG.seq_len)]
+            no_leak_tta_val_idx = [i for i in tta_val_idx if (i-1000)%99%2==0]
+            val_idx = list(tta_val_idx) + list(no_leak_tta_val_idx)
+            print(f'len(val_idx): {len(val_idx)}')
             with timer(f'##### Running Fold: {fold} #####'):
                 _predictions, _groundtruth = run(fold, trn_idx, val_idx)
                 predictions.append(_predictions)
@@ -664,4 +833,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main(X_train)
+
