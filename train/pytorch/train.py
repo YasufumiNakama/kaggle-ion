@@ -28,7 +28,7 @@ class CFG:
     nheads=10
     seq_len=5000
     total_cate_size=40
-    seed=777
+    seed=111
     encoder='Wavenet'
     optimizer='Adam' #@param ['AdamW', 'Adam']
     target_size=11
@@ -195,23 +195,41 @@ with timer('Data Loading'):
     X_train = load_df(path=df_path_dict['train'])
     #X_test = load_df(path=df_path_dict['test'])
     #sample_submission = load_df(path=df_path_dict['sample_submission'])
-    oof_lgb = pd.read_csv('../input/ion-oof/oof_lightgbm.csv').rename(columns={TARGET:'signal_lgb_oof'})
-    oof_cat = pd.read_csv('../input/ion-oof/oof_catboost.csv').rename(columns={TARGET:'signal_cat_oof'})
-    oof_xgb = pd.read_csv('../input/ion-oof/oof_xgb.csv').rename(columns={TARGET:'signal_xgb_oof'})
-    #oof_nn = pd.read_csv('../input/ion-oof/oof_nn.csv')
+    oof_lgb = pd.read_csv('../input/ion-oof/lgb_oof.csv').rename(columns={TARGET:'signal_lgb_oof'})
+    oof_cat = pd.read_csv('../input/ion-oof/cat_oof.csv').rename(columns={TARGET:'signal_cat_oof'})
 
     X_train = pd.concat([X_train, oof_lgb['signal_lgb_oof']], axis=1)
     X_train = pd.concat([X_train, oof_cat['signal_cat_oof']], axis=1)
-    X_train = pd.concat([X_train, oof_xgb['signal_xgb_oof']], axis=1)
-    #X_train = pd.concat([X_train, oof_nn.drop(columns=ID)], axis=1)
 
-    del oof_lgb, oof_cat, oof_xgb; gc.collect()
+    del oof_lgb, oof_cat; gc.collect()
 
 # =====================================================================================
 # Preprocess
 # =====================================================================================
 X_train['batch'] = X_train.index // 500000
 X_train['batch'] = X_train['batch'].astype(int)
+
+
+from sklearn.cluster import KMeans
+
+def categorize_batch(X_train, X_test=None):
+    aggs = ['median']
+    group_df = X_train.groupby('batch')['signal'].agg(aggs)
+    group_df.columns = pd.Index(['signal_{}'.format(c) for c in group_df.columns.tolist()])
+    cols = ['signal_median']
+    print(f'cols: {cols}')
+    kmeans = KMeans(n_clusters=5, random_state=42).fit(group_df[cols].values)
+    group_df['batch_category'] = kmeans.labels_
+    X_train = X_train.merge(group_df.reset_index()[['batch', 'batch_category']], on='batch', how='left')
+    if X_test is not None:
+        group_df = X_test.groupby('batch')['signal'].agg(aggs)
+        group_df.columns = pd.Index(['signal_{}'.format(c) for c in group_df.columns.tolist()])
+        group_df['batch_category'] = kmeans.predict(group_df[cols].values)
+        X_test = X_test.merge(group_df.reset_index()[['batch', 'batch_category']], on='batch', how='left')
+        return X_train, X_test
+    return X_train
+
+#X_train = categorize_batch(X_train, X_test=None)
 
 
 def signal2cate(X_train, X_test=None, NUM_BINS=1000):
@@ -241,21 +259,6 @@ def add_num_features(X_train, X_test=None):
     return X_train
 
 X_train = add_num_features(X_train, X_test=None)
-
-def categorize_batch(X_train, X_test=None):
-    a = X_train[['batch', 'signal']].groupby('batch').std().add_prefix('std_')
-    kmeans = KMeans(n_clusters=5, random_state=CFG.seed).fit(a[['std_signal']])
-    a['batch_category'] = kmeans.labels_
-    print(f'kmeans.labels_: {kmeans.labels_}')
-    X_train = X_train.merge(a.reset_index()[['batch', 'batch_category']], on='batch', how='left')
-    if X_test is not None:
-        b = X_test[['batch', 'signal']].groupby('batch').std().add_prefix('std_')
-        b['batch_category'] = kmeans.predict(b[['std_signal']])
-        X_test = X_test.merge(b.reset_index()[['batch', 'batch_category']], on='batch', how='left')
-        return X_train, X_test
-    return X_train
-
-#X_train = categorize_batch(X_train, X_test=None)
 
 def calc_gradients(df):
 
@@ -652,12 +655,13 @@ from torch.utils.data import DataLoader
 #from torchcontrib.optim import SWA
 
 
-def main(X_train):
+def main(X_train, folds):
 
     # =====================================================================================
     # Settings
     # =====================================================================================
-    cate_cols = [c for c in X_train.columns if c.find('cate')>=0]
+    #cate_cols = [c for c in X_train.columns if c.find('cate')>=0]
+    cate_cols = ['signal_cate']
     cont_cols = [c for c in X_train.columns if c.find('signal')>=0]
     cont_cols = [c for c in cont_cols if c not in cate_cols]
     logger.info(f'cont_cols: {cont_cols}')
@@ -794,21 +798,17 @@ def main(X_train):
     # =====================================================================================
     # k-fold
     # =====================================================================================
-    X_train['group'] = X_train.index // CFG.seq_len
-    X_train = tta_group(X_train)
-    X_train['tta_group'] = X_train['tta_group'].astype(int)
-    X_train['split_group'] = X_train.index // (CFG.seq_len*2)
-    sample_indices, group_indices = get_sample_indices(X_train)
+    folds = tta_group(folds)
+    folds['tta_group'] = folds['tta_group'].astype(int)
+    sample_indices, group_indices = get_sample_indices(folds)
     print(len(group_indices))
     print(len(set(group_indices)))
-    group_map = dict(X_train[['group', 'split_group']].values.tolist())
-    tta_group_map = dict(X_train[['tta_group', 'split_group']].values.tolist())
+    group_map = dict(folds[['group', 'split_group']].values.tolist())
+    tta_group_map = dict(folds[['tta_group', 'split_group']].values.tolist())
     group_map.update(tta_group_map)
     group_indices = [group_map[i] for i in group_indices]
     print(len(group_indices))
     print(len(set(group_indices)))
-    folds = make_stratified_group_k_folds(X_train, _id='time', target='open_channels', group='split_group', k=CFG.n_fold, seed=CFG.seed)
-    #folds = pd.read_csv('../input/ion-folds/folds.csv')
     folds_map = dict(folds[['split_group', 'fold']].values.tolist())
     group_indices = [folds_map[i] for i in group_indices]
     skf = GroupKFold(n_splits=CFG.n_fold)
@@ -833,5 +833,6 @@ def main(X_train):
 
 
 if __name__ == '__main__':
-    main(X_train)
+    folds = pd.read_csv('../input/ion-prepare-data/folds.csv')
+    main(X_train, folds)
 
